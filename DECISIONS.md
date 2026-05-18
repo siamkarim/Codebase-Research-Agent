@@ -75,10 +75,14 @@ Large repos (like FastAPI's ~200k-line codebase) require careful token managemen
 
 ## How I Used AI Tools
 
-This project was built using Claude as the primary development tool (via the Codebase Research Agent spec itself):
+I used Claude (via Claude Code in VS Code) as my primary development tool throughout this task.
 
-- **AI-generated**: The overall structure, all boilerplate (settings.py, models.py, serializers.py), the TOOL_DEFINITIONS schema, and the agent loop skeleton were generated from the spec. The system prompt wording was also largely spec-driven.
-- **Manually written / heavily reviewed**: The `_validate_path()` security check in `code_tools.py` (path traversal prevention), the `search_code()` fallback logic, the grep argument construction (include patterns per extension), and the thread safety notes in `views.py`.
-- **Where AI helped most**: Scaffolding the Django boilerplate quickly, ensuring all serializer fields matched the model fields, and generating the comprehensive TOOL_DEFINITIONS with correct JSON Schema.
-- **Where AI got it wrong**: Initial drafts of `search_code()` tried to pass all READABLE_EXTENSIONS as a single `--include` glob, which grep doesn't support. Had to restructure to multiple `--include=*.ext` flags. Also, early `run()` implementations didn't correctly handle the case where Claude returns multiple tool_use blocks in a single response — had to iterate over `response.content` and collect all results before appending the user message.
-- **Prompting approach**: Used the spec as a structured prompt with explicit section headers and code skeletons. The most effective pattern was providing the exact function signature + docstring and letting the implementation fill in — rather than asking for whole files at once.
+**What I generated with AI**: The initial scaffolding — settings.py, models.py, serializers.py, the TOOL_DEFINITIONS JSON schema, and the agent loop skeleton. This saved probably 3-4 hours of boilerplate work.
+
+**What I wrote or heavily edited myself**: The path traversal security check in code_tools.py — I didn't trust AI to get the edge cases right on something security-sensitive, so I wrote and tested that manually. The grep argument construction in search_code() also needed manual fixes; the initial AI version passed all extensions as a single glob which grep doesn't support. I restructured it to multiple --include=*.ext flags.
+
+**Where AI helped most**: Keeping serializer fields in sync with model fields, and generating well-structured JSON Schema for tool definitions. Things I would have gotten wrong through copy-paste errors.
+
+**Where AI got it wrong**: The first version of run() didn't handle the case where Claude returns multiple tool_use blocks in a single response. It only processed the first one. I caught this during testing when the agent would sometimes skip tool results, and fixed it by iterating over the full response.content list before appending the user message.
+
+**My prompting approach**: I used the spec as a structured prompt with explicit section headers and function signatures. The most effective pattern was providing the exact signature + docstring and letting AI fill in the implementation — rather than asking for whole files at once. I reviewed every generated function before moving on.

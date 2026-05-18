@@ -3,3 +3,4 @@ djangorestframework>=3.14
 anthropic>=0.25
 python-dotenv>=1.0
 requests>=2.31
+gitpython>=3.1
