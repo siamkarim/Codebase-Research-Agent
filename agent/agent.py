@@ -1,8 +1,11 @@
 import anthropic
 import json
 import logging
+from collections.abc import Mapping
 from django.conf import settings
 from django.utils import timezone
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
@@ -182,12 +185,39 @@ COST AWARENESS:
 """
 
 
+def _build_gemini_tool() -> types.Tool:
+    return types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters_json_schema=t["input_schema"],
+            )
+            for t in TOOL_DEFINITIONS
+        ],
+    )
+
+
 class CodebaseResearchAgent:
     def __init__(self, session, repo_local_path: str):
         self.session = session
         self.repo_local_path = repo_local_path
         self.repo_url = session.repo.url
-        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        provider = getattr(settings, "LLM_PROVIDER", "anthropic")
+        if provider == "gemini":
+            if not getattr(settings, "GEMINI_API_KEY", None):
+                raise RuntimeError(
+                    "GEMINI_API_KEY, GOOGLE_API_KEY, or Gemini_API_Key must be set for Gemini provider."
+                )
+            self._genai_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            self._gemini_tool = _build_gemini_tool()
+            self.client = None
+        else:
+            if not getattr(settings, "ANTHROPIC_API_KEY", None):
+                raise RuntimeError("ANTHROPIC_API_KEY must be set for Anthropic provider.")
+            self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            self._genai_client = None
+            self._gemini_tool = None
         self.messages = []
         self.step_count = 0
         self.max_steps = settings.MAX_AGENT_STEPS
@@ -195,6 +225,59 @@ class CodebaseResearchAgent:
 
     def _build_system_prompt(self) -> str:
         return SYSTEM_PROMPT.format(max_steps=self.max_steps)
+
+    @staticmethod
+    def _normalize_function_call_args(fc) -> dict:
+        raw = getattr(fc, "args", None)
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        if hasattr(raw, "model_dump"):
+            dumped = raw.model_dump()
+            return dumped if isinstance(dumped, dict) else {}
+        if isinstance(raw, Mapping):
+            return dict(raw.items())
+        return {}
+
+    def _accumulate_gemini_usage(self, response):
+        md = getattr(response, "usage_metadata", None)
+        if md is None:
+            return
+        prompt = getattr(md, "prompt_token_count", None) or 0
+        candidates = getattr(md, "candidates_token_count", None) or 0
+        self.total_tokens += int(prompt) + int(candidates)
+
+    @staticmethod
+    def _gemini_response_text(response) -> str:
+        text = getattr(response, "text", None)
+        if text and text.strip():
+            return text.strip()
+        for cand in getattr(response, "candidates", None) or []:
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", None) or []:
+                pt = getattr(part, "text", None)
+                if pt and pt.strip():
+                    return pt.strip()
+        return ""
+
+    def _gemini_generate(self, contents, *, tools_enabled: bool):
+        cfg_kw = {
+            "system_instruction": self._build_system_prompt(),
+            "max_output_tokens": 2048,
+            "temperature": 0.2,
+        }
+        if tools_enabled:
+            cfg_kw["tools"] = [self._gemini_tool]
+            cfg_kw["max_output_tokens"] = 4096
+        cfg = types.GenerateContentConfig(**cfg_kw)
+        return self._genai_client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=contents,
+            config=cfg,
+        )
 
     def _execute_tool(self, tool_name: str, tool_input: dict) -> str:
         from agent.tools.code_tools import (
@@ -247,111 +330,230 @@ class CodebaseResearchAgent:
         self.step_count += 1
         return output_str
 
-    def run(self) -> str:
-        try:
-            self.messages = [{"role": "user", "content": self.session.question}]
-            answer = ""
+    def _run_anthropic(self) -> str:
+        self.messages = [{"role": "user", "content": self.session.question}]
+        answer = ""
 
-            while True:
-                # Force-stop: exceeded max steps
-                if self.step_count >= self.max_steps:
-                    logger.warning(f"Session {self.session.id}: max steps reached, forcing finish")
-                    self.messages.append({
-                        "role": "user",
-                        "content": (
-                            "You have reached the maximum number of tool calls. "
-                            "Please provide your best answer now based on what you have found so far."
-                        ),
-                    })
-                    final_response = self.client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=2048,
-                        system=self._build_system_prompt(),
-                        messages=self.messages,
-                    )
-                    self.total_tokens += (
-                        final_response.usage.input_tokens + final_response.usage.output_tokens
-                    )
-                    for block in final_response.content:
-                        if hasattr(block, "text"):
-                            answer = block.text
-                    break
-
-                # Token budget exceeded
-                if self.total_tokens >= settings.MAX_TOKENS_BUDGET:
-                    logger.warning(f"Session {self.session.id}: token budget exhausted")
-                    answer = (
-                        "Research stopped: token budget exceeded. "
-                        "Please check the findings saved so far for partial results."
-                    )
-                    break
-
-                response = self.client.messages.create(
+        while True:
+            # Force-stop: exceeded max steps
+            if self.step_count >= self.max_steps:
+                logger.warning(f"Session {self.session.id}: max steps reached, forcing finish")
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "You have reached the maximum number of tool calls. "
+                        "Please provide your best answer now based on what you have found so far."
+                    ),
+                })
+                final_response = self.client.messages.create(
                     model="claude-sonnet-4-20250514",
-                    max_tokens=4096,
+                    max_tokens=2048,
                     system=self._build_system_prompt(),
-                    tools=TOOL_DEFINITIONS,
                     messages=self.messages,
                 )
+                self.total_tokens += (
+                    final_response.usage.input_tokens + final_response.usage.output_tokens
+                )
+                for block in final_response.content:
+                    if hasattr(block, "text"):
+                        answer = block.text
+                break
 
-                self.total_tokens += response.usage.input_tokens + response.usage.output_tokens
+            # Token budget exceeded
+            if self.total_tokens >= settings.MAX_TOKENS_BUDGET:
+                logger.warning(f"Session {self.session.id}: token budget exhausted")
+                answer = (
+                    "Research stopped: token budget exceeded. "
+                    "Please check the findings saved so far for partial results."
+                )
+                break
 
-                if response.stop_reason == "end_turn":
-                    for block in response.content:
-                        if hasattr(block, "text"):
-                            answer = block.text
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                system=self._build_system_prompt(),
+                tools=TOOL_DEFINITIONS,
+                messages=self.messages,
+            )
+
+            self.total_tokens += response.usage.input_tokens + response.usage.output_tokens
+
+            if response.stop_reason == "end_turn":
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        answer = block.text
+                break
+
+            if response.stop_reason == "tool_use":
+                self.messages.append({"role": "assistant", "content": response.content})
+
+                tool_results = []
+                finish_answer = None
+
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+
+                    tool_name = block.name
+                    tool_input = block.input
+
+                    if tool_name == "finish":
+                        finish_answer = tool_input.get("answer", "")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps({"status": "session_finished"}),
+                        })
+                        self.step_count += 1
+                        from agent.tools.db_tools import log_tool_call
+
+                        log_tool_call(
+                            session_id=self.session.id,
+                            tool_name="finish",
+                            input_args=tool_input,
+                            output_summary="Session finished by agent",
+                            success=True,
+                        )
+                    else:
+                        result_str = self._execute_tool(tool_name, tool_input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+
+                self.messages.append({"role": "user", "content": tool_results})
+
+                if finish_answer is not None:
+                    answer = finish_answer
                     break
+            else:
+                logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
+                break
 
-                if response.stop_reason == "tool_use":
-                    # Append assistant turn
-                    self.messages.append({"role": "assistant", "content": response.content})
+        return answer
 
-                    tool_results = []
-                    finish_answer = None
+    def _run_gemini(self) -> str:
+        from agent.tools.db_tools import log_tool_call
 
-                    for block in response.content:
-                        if block.type != "tool_use":
-                            continue
+        contents: list = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=self.session.question)],
+            ),
+        ]
+        answer = ""
 
-                        tool_name = block.name
-                        tool_input = block.input
+        blocking_reasons = frozenset(
+            {
+                types.FinishReason.SAFETY,
+                types.FinishReason.BLOCKLIST,
+                types.FinishReason.PROHIBITED_CONTENT,
+                types.FinishReason.SPII,
+                types.FinishReason.RECITATION,
+            },
+        )
 
-                        if tool_name == "finish":
-                            # Don't log finish as a regular tool — just capture it
-                            finish_answer = tool_input.get("answer", "")
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": json.dumps({"status": "session_finished"}),
-                            })
-                            # Still count it toward step budget
-                            self.step_count += 1
-                            from agent.tools.db_tools import log_tool_call
-                            log_tool_call(
-                                session_id=self.session.id,
-                                tool_name="finish",
-                                input_args=tool_input,
-                                output_summary="Session finished by agent",
-                                success=True,
-                            )
-                        else:
-                            result_str = self._execute_tool(tool_name, tool_input)
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result_str,
-                            })
+        while True:
+            if self.step_count >= self.max_steps:
+                logger.warning(f"Session {self.session.id}: max steps reached, forcing finish")
+                contents.append(types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "You have reached the maximum number of tool calls. "
+                                "Please provide your best answer now based on what you have found."
+                            ),
+                        ),
+                    ],
+                ))
+                resp = self._gemini_generate(contents, tools_enabled=False)
+                self._accumulate_gemini_usage(resp)
+                answer = self._gemini_response_text(resp)
+                break
 
-                    # Append tool results as user message
-                    self.messages.append({"role": "user", "content": tool_results})
+            if self.total_tokens >= settings.MAX_TOKENS_BUDGET:
+                logger.warning(f"Session {self.session.id}: token budget exhausted")
+                answer = (
+                    "Research stopped: token budget exceeded. "
+                    "Please check the findings saved so far for partial results."
+                )
+                break
 
-                    if finish_answer is not None:
-                        answer = finish_answer
-                        break
+            response = self._gemini_generate(contents, tools_enabled=True)
+            self._accumulate_gemini_usage(response)
+
+            if not getattr(response, "candidates", None):
+                fb = getattr(response, "prompt_feedback", None)
+                msg = getattr(fb, "block_reason", None) if fb else None
+                raise RuntimeError(msg or "Gemini returned no response candidates.")
+
+            cand = response.candidates[0]
+            if cand.finish_reason in blocking_reasons and not (response.function_calls or []):
+                raise RuntimeError(
+                    f"Gemini stopped with finish_reason={cand.finish_reason!r}; no tool calls."
+                )
+
+            fc_list = list(getattr(response, "function_calls", None) or [])
+
+            if not fc_list:
+                answer = self._gemini_response_text(response)
+                if not answer:
+                    raise RuntimeError(
+                        f"Gemini returned empty text and no tool calls "
+                        f"(finish_reason={cand.finish_reason!r})."
+                    )
+                break
+
+            contents.append(response.candidates[0].content)
+
+            finish_answer = None
+            tool_parts: list = []
+
+            for fc in fc_list:
+                tool_name = fc.name
+                tool_input = self._normalize_function_call_args(fc)
+
+                if tool_name == "finish":
+                    finish_answer = tool_input.get("answer", "")
+                    tool_parts.append(
+                        types.Part.from_function_response(
+                            name=tool_name,
+                            response={"result": '{"status":"session_finished"}'},
+                        ),
+                    )
+                    self.step_count += 1
+                    log_tool_call(
+                        session_id=self.session.id,
+                        tool_name="finish",
+                        input_args=tool_input,
+                        output_summary="Session finished by agent",
+                        success=True,
+                    )
                 else:
-                    # Unexpected stop reason
-                    logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
-                    break
+                    result_str = self._execute_tool(tool_name, tool_input)
+                    tool_parts.append(
+                        types.Part.from_function_response(
+                            name=tool_name,
+                            response={"result": result_str},
+                        ),
+                    )
+
+            contents.append(types.Content(role="tool", parts=tool_parts))
+
+            if finish_answer is not None:
+                answer = finish_answer
+                break
+
+        return answer
+
+    def run(self) -> str:
+        try:
+            if getattr(settings, "LLM_PROVIDER", "anthropic") == "gemini":
+                answer = self._run_gemini()
+            else:
+                answer = self._run_anthropic()
 
             self.session.final_answer = answer
             self.session.status = "completed"

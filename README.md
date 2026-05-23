@@ -15,7 +15,7 @@ python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+# Edit .env — set GEMINI_API_KEY (or GOOGLE_API_KEY). With a Gemini key set, Gemini is used by default unless LLM_PROVIDER=anthropic.
 python manage.py migrate
 python manage.py runserver
 ```
@@ -100,7 +100,7 @@ The admin shows all repositories, research sessions, tool call logs, and finding
 
 - **Django REST Framework** handles the API layer with clean serializers and views.
 - **Background threading** (`threading.Thread`) runs the agent asynchronously so the API returns 202 immediately.
-- **Claude claude-sonnet-4-20250514** drives the agent loop via the Anthropic SDK with tool calling.
+- **Gemini** (see `GEMINI_MODEL` in settings; default `gemini-2.5-flash`) or **Claude claude-sonnet-4-20250514** drives the agent via function/tool calling — see `LLM_PROVIDER` and API keys in `.env.example`.
 - **4 database models**: Repository, ResearchSession, ToolCallLog, Finding — see `agent/models.py`.
 - **Tool suite**: `list_files`, `read_file`, `search_code`, `get_file_summary`, `save_finding`, `get_previous_findings`, `list_past_sessions`, `finish`.
 

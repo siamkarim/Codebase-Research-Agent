@@ -2,11 +2,12 @@ import json
 import tempfile
 import threading
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from django.test import TestCase
-from django.urls import reverse
+from django.test import TestCase, override_settings
+from google.genai import types
 
+from agent.agent import CodebaseResearchAgent
 from agent.models import Repository, ResearchSession
 from agent.tools.code_tools import list_files
 
@@ -180,3 +181,63 @@ class StartSessionViewTest(TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("error", response.json())
+
+
+class GeminiAgentRunTest(TestCase):
+    """Verifies Gemini provider agent loop wiring without calling Google."""
+
+    def setUp(self):
+        self.repo = Repository.objects.create(
+            url="https://github.com/test/gemini-mock-repo",
+            name="test/gemini-mock-repo",
+        )
+        self.session = ResearchSession.objects.create(
+            repo=self.repo,
+            question="Smoke test question about this repository.",
+            status="pending",
+        )
+
+    @staticmethod
+    def _fake_usage_meta():
+        m = MagicMock()
+        m.prompt_token_count = 10
+        m.candidates_token_count = 5
+        return m
+
+    def _response_with_tools(self, name: str, args: dict):
+        fc = MagicMock()
+        fc.name = name
+        fc.args = args
+        cand = MagicMock()
+        cand.content = MagicMock()
+        cand.finish_reason = types.FinishReason.STOP
+        r = MagicMock()
+        r.function_calls = [fc]
+        r.candidates = [cand]
+        r.usage_metadata = self._fake_usage_meta()
+        r.text = ""
+        return r
+
+    @override_settings(LLM_PROVIDER="gemini", GEMINI_API_KEY="test-gemini-key-fake")
+    @patch("agent.agent.genai.Client")
+    def test_gemini_turn_get_previous_findings_then_finish(self, mock_client_cls):
+        mock_instance = MagicMock()
+        mock_client_cls.return_value = mock_instance
+        mock_instance.models.generate_content.side_effect = [
+            self._response_with_tools("get_previous_findings", {}),
+            self._response_with_tools("finish", {
+                "answer": "No earlier findings exist for this repository.",
+                "file_references": ["README.md"],
+            }),
+        ]
+
+        agent = CodebaseResearchAgent(self.session, "/tmp")
+        answer = agent.run()
+
+        mock_instance.models.generate_content.assert_called()
+        self.assertEqual(mock_instance.models.generate_content.call_count, 2)
+
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, "completed")
+        self.assertIn("No earlier findings", answer)
+        self.assertGreater(self.session.total_tokens_used, 0)

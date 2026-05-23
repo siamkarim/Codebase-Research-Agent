@@ -1,6 +1,7 @@
 django>=4.2,<5.0
 djangorestframework>=3.14
 anthropic>=0.25
+google-genai>=1.0
 python-dotenv>=1.0
 requests>=2.31
 gitpython>=3.1

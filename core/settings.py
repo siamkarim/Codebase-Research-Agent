@@ -87,6 +87,23 @@ REST_FRAMEWORK = {
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# Gemini Developer API: standard env names plus Gemini_API_Key (common .env typo).
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or os.getenv("Gemini_API_Key")
+)
+
+_llm_explicit = os.getenv("LLM_PROVIDER", "").strip().lower()
+if _llm_explicit in ("anthropic", "gemini"):
+    LLM_PROVIDER = _llm_explicit
+elif GEMINI_API_KEY:
+    LLM_PROVIDER = "gemini"
+else:
+    LLM_PROVIDER = "anthropic"
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
 REPOS_DIR = BASE_DIR / "repos"
 REPOS_DIR.mkdir(exist_ok=True)
 

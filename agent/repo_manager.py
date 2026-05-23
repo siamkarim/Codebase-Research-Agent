@@ -38,11 +38,14 @@ def clone_or_update_repo(repo_url: str):
             origin.pull(ff_only=True)
         except InvalidGitRepositoryError:
             logger.warning(f"{local_path} is not a valid git repo, re-cloning")
-            shutil.rmtree(local_path)
+            shutil.rmtree(local_path, ignore_errors=True)
             _clone(repo_url, local_path)
-        except GitCommandError as e:
-            logger.warning(f"git pull failed, re-cloning: {e}")
-            shutil.rmtree(local_path)
+        except Exception as e:
+            # GitCommandError, broken remote refspecs, missing origin fetch config, etc.
+            logger.warning(
+                "Updating existing repo failed (%s: %s), re-cloning", type(e).__name__, e
+            )
+            shutil.rmtree(local_path, ignore_errors=True)
             _clone(repo_url, local_path)
     else:
         _clone(repo_url, local_path)

@@ -6,7 +6,7 @@ The Codebase Research Agent is structured as a layered Django REST API backed by
 
 - **API Layer (views.py)**: Django REST Framework views handle HTTP concerns — validation, serialization, 202 response, error handling. Views delegate business logic immediately.
 - **Repo Manager (repo_manager.py)**: Isolates all git operations (clone/pull). Returns a `(Repository, local_path)` tuple. This is the only synchronous blocking step before the thread spawns.
-- **Agent Loop (agent.py)**: `CodebaseResearchAgent` drives the Claude tool-calling loop. It manages message history, token tracking, step counting, and maps tool names to implementations.
+- **Agent Loop (agent.py)**: `CodebaseResearchAgent` drives the tool-calling loop (Gemini via `google-genai` or Claude via Anthropic SDK). It manages message history, token tracking, step counting, and maps tool names to implementations.
 - **Tools Layer (tools/)**: `code_tools.py` handles all filesystem interactions; `db_tools.py` handles all ORM writes. Both are pure functions — no class state — making them easy to test independently.
 - **Database (models.py)**: Four models capture the full lifecycle: `Repository` → `ResearchSession` → `ToolCallLog` + `Finding`.
 
@@ -51,11 +51,11 @@ Large repos (like FastAPI's ~200k-line codebase) require careful token managemen
 - **`search_code()` via grep**: Jumps directly to relevant code without reading directories. Searching "Depends" across the FastAPI repo surfaces the dependency injection machinery in 2-3 results without touching unrelated files.
 - **Previous findings loaded first**: `get_previous_findings()` is the mandatory first call. The agent inherits knowledge from prior sessions, reducing redundant exploration on repeated questions about the same repo.
 
-## LLM Choice: Claude claude-sonnet-4-20250514
+## LLM Choice: Gemini (default) vs Claude
 
-- **Best-in-class tool calling**: Sonnet reliably follows complex multi-step tool-use instructions, respects ordering constraints (e.g., "always call get_previous_findings first"), and produces well-structured `finish()` outputs.
-- **Code understanding**: Strong at reading Python, TypeScript, and configuration files — exactly what this agent needs.
-- **Cost/performance balance**: Sonnet offers near-Opus quality at significantly lower cost, which matters when a single research session might involve 10-15 tool calls and 30k input tokens.
+- **`LLM_PROVIDER` / keys**: With `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `Gemini_API_Key` present, Gemini is used by default (`GEMINI_MODEL`, default `gemini-2.5-flash`). Set `LLM_PROVIDER=anthropic` and supply `ANTHROPIC_API_KEY` to force Claude (`claude-sonnet-4-20250514`).
+- **Claude**: Previously the single backend; Sonnet excels at structured tool chains and codebase reasoning.
+- **Gemini**: Google AI Studio key is enough for Development API; maps the same JSON-schema tools to Gemini `FunctionDeclaration` and preserves the `finish()` contract.
 
 ## What I'd Do Differently With More Time
 
